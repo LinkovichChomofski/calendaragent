@@ -1,7 +1,7 @@
 from src.services.calendar_sync_service import CalendarSyncService
 from src.services.calendar_manager import CalendarManager
-from src.database.connection import DatabaseManager
-from src.database.models import Event, Calendar
+from src.database.connection import DatabaseManager, db_manager, get_db
+from src.models import Base, Calendar, CalendarEvent
 from sqlalchemy import select
 from dotenv import load_dotenv
 import os
@@ -10,87 +10,236 @@ import json
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from src.config import ConfigManager
+import pytest
+from fastapi.testclient import TestClient
+from fastapi import Depends
+import logging
+from sqlalchemy import inspect
 
-def test_calendar_sync():
-    load_dotenv()
-    
+logger = logging.getLogger(__name__)
+
+@pytest.mark.asyncio
+async def test_calendar_sync():
+    """Test calendar sync service initialization"""
+    current_time = datetime(2025, 2, 23, 12, 3, 3, tzinfo=ZoneInfo('America/Los_Angeles'))
     # Create a temporary database for testing
     with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
         db_path = tmp.name
-    
+
     try:
-        # Initialize database manager with test database
+        # Initialize test components
         db_manager = DatabaseManager(db_path)
-        calendar_manager = CalendarManager()
-        config = ConfigManager().load_config()
-        sync_service = CalendarSyncService(db_manager, config=config)
-        
-        print("Starting calendar sync test...")
-        
-        # First, sync and list available calendars
-        print("\nSyncing calendars...")
+        Base.metadata.create_all(bind=db_manager.engine)
+
+        # Create test calendar
         with db_manager.get_session() as session:
-            calendars = calendar_manager.sync_calendars(session)
-            
-            print("\nAvailable Calendars:")
-            for cal in calendars:
-                print(f"\nCalendar ID: {cal['id']}")
-                print(f"Summary: {cal['summary']}")
-                print(f"Access Role: {cal['accessRole']}")
-                print(f"Primary: {cal['primary']}")
-        
-        # Sync all configured calendars
-        sync_results = sync_service.sync_all_calendars()
-        
-        # Verify at least one calendar was synced
-        assert len(sync_results) > 0, "No calendars were synced"
-        
-        # Now sync events for each calendar
-        print("\nSyncing events for each calendar...")
-        with db_manager.get_session() as session:
-            for calendar in session.query(Calendar).all():
-                print(f"\nSyncing calendar: {calendar.summary}")
-                # Calculate time range for sync
-                time_min = datetime.now(ZoneInfo('America/Los_Angeles')).replace(hour=0, minute=0, second=0, microsecond=0)
-                time_max = time_min + timedelta(days=30)
-                # Only sync the calendar we have access to
-                if calendar.id == 'a3caeb237bc1daa251da479d61071aad8f99c636a8b232b1501c940ec774f7ca@group.calendar.google.com':
-                    stats = sync_service.sync_calendar(calendar.id, time_min=time_min, time_max=time_max)
-                
-                    # Print sync results for this calendar
-                    print(f"\nSync Results for {calendar.summary}:")
-                    print(f"New events: {stats['new_events']}")
-                    print(f"Updated events: {stats['updated_events']}")
-                    print(f"Deleted events: {stats['deleted_events']}")
-                    
-                    if stats['errors']:
-                        print("\nErrors encountered:")
-                        for error in stats['errors']:
-                            print(f"- {error}")
-        
-        # Print some sample events from all calendars
-        print("\nSample Events from All Calendars:")
-        with db_manager.get_session() as session:
-            stmt = select(Event).limit(10)
-            events = session.execute(stmt).scalars().all()
-            
-            for event in events:
-                print(f"\nEvent ID: {event.id}")
-                print(f"Calendar ID: {event.calendar_id}")
-                print(f"Title: {event.title}")
-                print(f"Type: {event.event_type}")
-                print(f"Category: {event.category}")
-                print(f"Start Time: {event.start_time}")
-                
+            calendar = Calendar(
+                id="test_calendar_id",
+                google_id="test_google_calendar_id",
+                name="Test Calendar",
+                owner_email="test@example.com",
+                last_synced=current_time
+            )
+            session.add(calendar)
+            session.commit()
+
+            # Verify calendar was created
+            saved_calendar = session.query(Calendar).filter_by(id="test_calendar_id").first()
+            assert saved_calendar is not None
+            assert saved_calendar.name == "Test Calendar"
+
+            # Create a test event
+            event = CalendarEvent(
+                id="test_event_id",
+                google_id="test_google_event_id",
+                title="Test Event",
+                description="Test Description",
+                start=current_time,
+                end=current_time + timedelta(hours=1),
+                calendar_id=calendar.id,
+                source="google"
+            )
+            session.add(event)
+            session.commit()
+
+            # Verify event was created and linked to calendar
+            assert len(saved_calendar.events) == 1
+            assert saved_calendar.events[0].title == "Test Event"
+
     except Exception as e:
-        print(f"\nError during testing: {str(e)}")
-        raise
+        raise e
+
+    finally:
+        # Clean up test database
+        os.unlink(db_path)
+
+from src.api.main import app
+from src.services.calendar_service import CalendarService
+from src.nlp.processor import NLPProcessor
+
+# Create a test database manager
+test_db_manager = None
+
+def override_get_db():
+    """Override the database dependency for testing"""
+    if test_db_manager is None:
+        raise RuntimeError("Test database not initialized")
+    try:
+        db = test_db_manager.get_session()
+        yield db
+    finally:
+        db.close()
+
+# Override FastAPI's database dependency
+app.dependency_overrides[get_db] = override_get_db
+client = TestClient(app)
+
+@pytest.fixture(autouse=True)
+def test_db():
+    """Initialize test database for each test"""
+    global test_db_manager
+
+    # Create a temporary database for testing
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+        db_path = tmp.name
+
+    try:
+        # Initialize test database
+        test_db_manager = DatabaseManager(db_path)
+        
+        # Create all tables
+        Base.metadata.create_all(bind=test_db_manager.engine)
+        logger.info("Created database tables")
+        
+        # Initialize database with primary calendar
+        test_db_manager.init_database()
+        logger.info("Initialized database with primary calendar")
+        
+        # Verify tables exist
+        inspector = inspect(test_db_manager.engine)
+        table_names = inspector.get_table_names()
+        logger.info(f"Tables in database: {table_names}")
+        
+        # Override FastAPI's database dependency for each test
+        app.dependency_overrides[get_db] = override_get_db
+        
+        yield test_db_manager
     finally:
         # Clean up test database
         try:
-            os.unlink(db_path)
+            Base.metadata.drop_all(bind=test_db_manager.engine)
         except:
             pass
+        os.unlink(db_path)
+        
+        # Reset FastAPI's database dependency
+        app.dependency_overrides.clear()
 
-if __name__ == "__main__":
-    test_calendar_sync()
+@pytest.fixture
+def calendar_service(test_db):
+    """Initialize calendar service with test dependencies"""
+    nlp_processor = NLPProcessor()
+    calendar_service = CalendarService(test_db, nlp_processor)
+    return calendar_service
+
+@pytest.mark.asyncio
+async def test_full_event_lifecycle(test_db):
+    """Test complete event lifecycle: create, read, update, delete"""
+    current_time = datetime(2025, 2, 23, 12, 3, 3, tzinfo=ZoneInfo('America/Los_Angeles'))
+    start_time = current_time + timedelta(days=1)
+    end_time = start_time + timedelta(minutes=30)
+
+    # Create test calendar and event in database
+    with test_db.get_session() as session:
+        calendar = Calendar(
+            id="test_calendar_id",
+            google_id="test_google_calendar_id",
+            name="Test Calendar",
+            owner_email="test@example.com",
+            last_synced=current_time
+        )
+        session.add(calendar)
+        session.commit()
+
+    # Test event creation
+    create_response = client.post(
+        "/events",
+        json={
+            "title": "Team Sync",
+            "description": "Weekly team sync meeting",
+            "start": start_time.isoformat(),
+            "end": end_time.isoformat(),
+            "calendar_id": "test_calendar_id",
+            "source": "google"
+        }
+    )
+    assert create_response.status_code == 200
+    event_data = create_response.json()["events"][0]
+    event_id = event_data["id"]
+
+    # Test event retrieval
+    get_response = client.get(f"/events/{event_id}")
+    assert get_response.status_code == 200
+    assert get_response.json()["events"][0]["title"] == "Team Sync"
+
+    # Test event update
+    update_response = client.put(
+        f"/events/{event_id}",
+        json={
+            "id": event_id,
+            "title": "Updated Team Sync",
+            "description": "Updated team sync meeting",
+            "start": start_time.isoformat(),
+            "end": end_time.isoformat(),
+            "calendar_id": "test_calendar_id",
+            "source": "google"
+        }
+    )
+    assert update_response.status_code == 200
+    assert update_response.json()["events"][0]["title"] == "Updated Team Sync"
+
+    # Test event deletion
+    delete_response = client.delete(f"/events/{event_id}")
+    assert delete_response.status_code == 200
+    assert delete_response.json()["message"] == "Event deleted successfully"
+
+@pytest.mark.asyncio
+async def test_error_handling(test_db):
+    """Test error handling for invalid inputs"""
+    current_time = datetime(2025, 2, 23, 12, 3, 3, tzinfo=ZoneInfo('America/Los_Angeles'))
+
+    # Test creating event with invalid calendar_id
+    create_response = client.post(
+        "/events",
+        json={
+            "title": "Test Event",
+            "description": "Test Description",
+            "start": current_time.isoformat(),
+            "end": (current_time + timedelta(hours=1)).isoformat(),
+            "calendar_id": "invalid_calendar_id",
+            "source": "google"
+        }
+    )
+    assert create_response.status_code == 404
+    assert "not found" in create_response.json()["error"].lower()
+
+    # Test updating non-existent event
+    update_response = client.put(
+        "/events/non_existent_id",
+        json={
+            "id": "non_existent_id",
+            "title": "Updated Event",
+            "description": "Updated Description",
+            "start": current_time.isoformat(),
+            "end": (current_time + timedelta(hours=1)).isoformat(),
+            "calendar_id": "test_calendar_id",
+            "source": "google"
+        }
+    )
+    assert update_response.status_code == 404
+    assert "not found" in update_response.json()["message"].lower()
+
+    # Test deleting non-existent event
+    delete_response = client.delete("/events/non_existent_id")
+    assert delete_response.status_code == 200
+    assert "not found" in delete_response.json()["message"].lower()

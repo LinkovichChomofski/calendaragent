@@ -1,11 +1,12 @@
 'use client';
 
 import { useState, useEffect, useRef } from 'react';
-import { Box, Container, Paper, TextField, IconButton, Typography, Grid, CircularProgress } from '@mui/material';
-import { Send as SendIcon, Sync as SyncIcon } from '@mui/icons-material';
-import { api, Event, CommandResponse, SyncStatus } from '@/lib/api';
+import { Box, Container, Paper, TextField, IconButton, Typography, Grid, CircularProgress, Button } from '@mui/material';
+import { Send as SendIcon, Sync as SyncIcon, Add as AddIcon } from '@mui/icons-material';
+import { api, Event, CommandResponse, SyncStatus, EventCreateRequest } from '@/lib/api';
 import Calendar from '@/components/Calendar';
 import EventList from '@/components/EventList';
+import EventForm from '@/components/EventForm';
 
 export default function Home() {
   const [command, setCommand] = useState('');
@@ -13,8 +14,16 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [syncing, setSyncing] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [syncStatus, setSyncStatus] = useState<SyncStatus | null>(null);
+  const [syncStatus, setSyncStatus] = useState<SyncStatus>({
+    success: false,
+    new_events: 0,
+    updated_events: 0,
+    deleted_events: 0,
+    errors: []
+  });
   const [selectedDate, setSelectedDate] = useState(new Date());
+  const [selectedDateRange, setSelectedDateRange] = useState<'day' | 'week' | 'month'>('week');
+  const [eventFormOpen, setEventFormOpen] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
@@ -52,8 +61,25 @@ export default function Home() {
         const fullUrl = `${wsUrl}${path}`;
         console.log('Connecting to WebSocket:', fullUrl);
         
-        const ws = new WebSocket(fullUrl);
-        wsRef.current = ws;
+        let ws: WebSocket;
+        try {
+          ws = new WebSocket(fullUrl);
+          wsRef.current = ws;
+        } catch (err) {
+          console.error('Error creating WebSocket:', err);
+          isConnecting = false;
+          if (reconnectAttempts < maxReconnectAttempts) {
+            reconnectAttempts++;
+            const delay = Math.min(1000 * Math.pow(2, reconnectAttempts), 10000);
+            console.log('Planning WebSocket reconnection after connection error:', {
+              attempt: reconnectAttempts,
+              maxAttempts: maxReconnectAttempts,
+              delayMs: delay
+            });
+            reconnectTimeout = setTimeout(() => connectWebSocket(useFallbackPath), delay);
+          }
+          return;
+        }
         
         ws.onopen = () => {
           console.log('WebSocket connection opened successfully');
@@ -62,7 +88,11 @@ export default function Home() {
           
           // Send initial ping
           if (ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({ type: 'ping' }));
+            try {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            } catch (err) {
+              console.error('Error sending initial ping:', err);
+            }
           }
         };
         
@@ -106,8 +136,15 @@ export default function Home() {
             if (data.type === 'connection_established') {
               console.log('WebSocket connection established confirmation received');
             } else if (data.type === 'sync_complete') {
-              console.log('Sync complete notification received:', data.stats);
-              setSyncStatus(data.stats);
+              console.log('Sync complete notification received:', data.data);
+              // Ensure data has all the required properties
+              setSyncStatus({
+                success: data?.data?.success || false,
+                new_events: data?.data?.new_events || 0,
+                updated_events: data?.data?.updated_events || 0,
+                deleted_events: data?.data?.deleted_events || 0,
+                errors: data?.data?.errors || []
+              });
               setSyncing(false);
               fetchEvents();
             } else if (data.type === 'pong') {
@@ -165,12 +202,44 @@ export default function Home() {
 
   const fetchEvents = async () => {
     try {
-      const data = await api.getWeekEvents();
+      let data: Event[] = [];
+      
+      setLoading(true);
+      
+      try {
+        switch (selectedDateRange) {
+          case 'day':
+            // Get events for selected day
+            const startOfDay = new Date(selectedDate);
+            startOfDay.setHours(0, 0, 0, 0);
+            const endOfDay = new Date(selectedDate);
+            endOfDay.setHours(23, 59, 59, 999);
+            data = await api.getEventsForRange(startOfDay, endOfDay);
+            break;
+          case 'week':
+            data = await api.getWeekEvents();
+            break;
+          case 'month':
+            data = await api.getMonthEvents();
+            break;
+          default:
+            data = await api.getWeekEvents();
+        }
+      } catch (apiError) {
+        console.error('API error when fetching events:', apiError);
+        // Set data to empty array if API call fails
+        data = [];
+        setError(apiError instanceof Error ? apiError.message : 'Failed to fetch events from server');
+      }
+      
       setEvents(data);
-      setError(null);
     } catch (err) {
       console.error('Error fetching events:', err);
       setError(err instanceof Error ? err.message : 'Failed to fetch events');
+      // Set events to empty array to prevent UI from crashing
+      setEvents([]);
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -180,10 +249,25 @@ export default function Home() {
     
     try {
       const data = await api.syncCalendar();
-      setSyncStatus(data);
+      // Ensure data has all the required properties
+      setSyncStatus({
+        success: data?.success || false,
+        new_events: data?.new_events || 0,
+        updated_events: data?.updated_events || 0,
+        deleted_events: data?.deleted_events || 0,
+        errors: data?.errors || []
+      });
     } catch (err) {
       console.error('Error syncing calendar:', err);
       setError(err instanceof Error ? err.message : 'Sync failed');
+      // Reset syncStatus to default values
+      setSyncStatus({
+        success: false,
+        new_events: 0,
+        updated_events: 0,
+        deleted_events: 0,
+        errors: ['Sync failed: ' + (err instanceof Error ? err.message : 'Unknown error')]
+      });
       setSyncing(false);
     }
   };
@@ -209,6 +293,56 @@ export default function Home() {
     }
   };
 
+  const handleDateRangeChange = (range: 'day' | 'week' | 'month') => {
+    setSelectedDateRange(range);
+    // When changing date range, we should fetch events for that range
+    setTimeout(fetchEvents, 0);
+  };
+
+  const handleDeleteEvent = async (eventId: string) => {
+    try {
+      setLoading(true);
+      const response = await api.deleteEvent(eventId);
+      if (response.success) {
+        // Remove the deleted event from the local state
+        setEvents(events.filter(event => event.id !== eventId));
+        setError(null);
+      } else {
+        setError(response.error || 'Failed to delete event');
+      }
+    } catch (err) {
+      console.error('Error deleting event:', err);
+      setError(err instanceof Error ? err.message : 'Failed to delete event');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleCreateEvent = async (eventData: EventCreateRequest) => {
+    try {
+      setLoading(true);
+      const response = await api.createEvent(eventData);
+      if (response.success) {
+        setEventFormOpen(false);
+        // Refresh the events list
+        fetchEvents();
+        setError(null);
+      } else {
+        setError(response.error || 'Failed to create event');
+      }
+    } catch (err) {
+      console.error('Error creating event:', err);
+      setError(err instanceof Error ? err.message : 'Failed to create event');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    // Fetch events whenever the selected date or date range changes
+    fetchEvents();
+  }, [selectedDate, selectedDateRange]);
+
   return (
     <Container maxWidth="lg" sx={{ py: 4 }}>
       <Paper elevation={3} sx={{ p: 3, mb: 3 }}>
@@ -216,6 +350,41 @@ export default function Home() {
           <Typography variant="h4" component="h1" sx={{ flexGrow: 1 }}>
             Calendar Agent
           </Typography>
+          
+          <Box sx={{ display: 'flex', mr: 2 }}>
+            <IconButton
+              onClick={() => handleDateRangeChange('day')}
+              color={selectedDateRange === 'day' ? 'primary' : 'default'}
+              title="Day view"
+            >
+              <span style={{ fontSize: '0.8rem' }}>Day</span>
+            </IconButton>
+            <IconButton
+              onClick={() => handleDateRangeChange('week')}
+              color={selectedDateRange === 'week' ? 'primary' : 'default'}
+              title="Week view"
+            >
+              <span style={{ fontSize: '0.8rem' }}>Week</span>
+            </IconButton>
+            <IconButton
+              onClick={() => handleDateRangeChange('month')}
+              color={selectedDateRange === 'month' ? 'primary' : 'default'}
+              title="Month view"
+            >
+              <span style={{ fontSize: '0.8rem' }}>Month</span>
+            </IconButton>
+          </Box>
+          
+          <Button
+            variant="contained"
+            color="primary"
+            startIcon={<AddIcon />}
+            onClick={() => setEventFormOpen(true)}
+            sx={{ mr: 2 }}
+          >
+            Create Event
+          </Button>
+          
           <IconButton
             onClick={handleSync}
             disabled={syncing}
@@ -228,23 +397,23 @@ export default function Home() {
           </IconButton>
         </Box>
 
-        {syncStatus && (
+        {syncStatus && (syncStatus.new_events > 0 || syncStatus.updated_events > 0 || syncStatus.deleted_events > 0 || (syncStatus.errors && syncStatus.errors.length > 0)) && (
           <Paper variant="outlined" sx={{ p: 2, mb: 2 }}>
             <Typography variant="subtitle2" color="text.secondary" gutterBottom>
               Last Sync Results:
             </Typography>
             <Box sx={{ display: 'flex', gap: 2, flexWrap: 'wrap' }}>
               <Typography>
-                <strong>New Events:</strong> {syncStatus.new_events}
+                <strong>New Events:</strong> {syncStatus.new_events || 0}
               </Typography>
               <Typography>
-                <strong>Updated:</strong> {syncStatus.updated_events}
+                <strong>Updated:</strong> {syncStatus.updated_events || 0}
               </Typography>
               <Typography>
-                <strong>Deleted:</strong> {syncStatus.deleted_events}
+                <strong>Deleted:</strong> {syncStatus.deleted_events || 0}
               </Typography>
             </Box>
-            {syncStatus.errors.length > 0 && (
+            {syncStatus.errors && syncStatus.errors.length > 0 && (
               <Typography color="error" sx={{ mt: 1 }}>
                 Errors: {syncStatus.errors.join(', ')}
               </Typography>
@@ -272,6 +441,8 @@ export default function Home() {
             <EventList
               events={events}
               date={selectedDate}
+              dateRange={selectedDateRange}
+              onDeleteEvent={handleDeleteEvent}
             />
           </Grid>
         </Grid>
@@ -287,9 +458,7 @@ export default function Home() {
             disabled={loading}
             inputProps={{
               'aria-label': 'Command input',
-              autoComplete: 'off',
-              'data-form-type': 'other',
-              'data-dashlane-label': 'command'
+              autoComplete: 'off'
             }}
             autoComplete="off"
           />
@@ -303,6 +472,14 @@ export default function Home() {
           </IconButton>
         </Box>
       </Paper>
+      
+      {/* Event Form Dialog */}
+      <EventForm 
+        open={eventFormOpen}
+        onClose={() => setEventFormOpen(false)}
+        onSubmit={handleCreateEvent}
+        initialDate={selectedDate}
+      />
     </Container>
   );
 }

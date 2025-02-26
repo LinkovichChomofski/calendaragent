@@ -1,19 +1,32 @@
 import os
 import sys
 import logging
+import traceback
 from typing import List, Optional, Dict, Any
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends, Request
+from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-import pytz
-import traceback
 from pydantic import BaseModel
 from zoneinfo import ZoneInfo
 import json
+import uuid
+
+from src.models.calendar import Calendar
+from src.models.event import CalendarEvent as CalendarEventPydantic
+from src.database.connection import get_db, DatabaseManager
+from src.database.models import CalendarEvent as DBCalendarEvent
+import pytz
+
+from src.config.manager import ConfigManager
+from src.services.calendar_sync_service import CalendarSyncService
+from src.services.calendar_manager import CalendarManager
+from src.nlp.processor import NLPProcessor
+from src.integrations.google_calendar import GoogleCalendarClient
 
 # Configure logging
-logging.basicConfig(level=logging.DEBUG)
+logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Add the src directory to the Python path
@@ -22,61 +35,38 @@ sys.path.append(root_dir)
 logger.info(f"Added {root_dir} to Python path")
 logger.info(f"Current PYTHONPATH: {os.environ.get('PYTHONPATH', '')}")
 
-from src.config.manager import ConfigManager
-from src.database.session import get_db
-from src.services.calendar_sync_service import CalendarSyncService
-from src.database.models import Event
-from src.services.calendar_manager import CalendarManager
+# Initialize services
+config_manager = ConfigManager()
+google_config = config_manager._load_google_config()
+db_manager = DatabaseManager()
+google_client = GoogleCalendarClient(config=google_config)
+nlp_processor = NLPProcessor()
+calendar_sync_service = CalendarSyncService(db_manager, google_client, nlp_processor)
 
-# Pydantic models for API
-class CommandRequest(BaseModel):
-    command: str
+logger.info("Services initialized successfully")
 
-class EventResponse(BaseModel):
-    id: int
-    title: str
-    type: str
-    category: str
-    start_time: datetime
-    end_time: Optional[datetime] = None
-    location: Optional[str] = None
-    description: Optional[str] = None
-    participants: List[str] = []
-
-class CommandResponse(BaseModel):
-    success: bool
-    message: str
-    events: Optional[List[EventResponse]] = None
-    error: Optional[str] = None
-
-class SyncStatus(BaseModel):
-    new_events: int = 0
-    updated_events: int = 0
-    deleted_events: int = 0
-    errors: List[str] = []
-
+# Initialize FastAPI app
 app = FastAPI(title="Calendar Agent API")
 
 # CORS Configuration
+origins = [
+    "http://localhost:3000",
+    "http://localhost:3001",
+    "http://localhost:3002", 
+    "http://localhost:3003",
+    "http://127.0.0.1:3000",
+    "http://127.0.0.1:3001",
+    "http://127.0.0.1:3002",
+    "http://127.0.0.1:3003",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://localhost:3001"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-logger.info("Initializing services...")
-# Initialize services
-config = ConfigManager()
-google_config = config._load_google_config()
-
-# Add required type field if not present
-if 'type' not in google_config:
-    google_config['type'] = 'service_account'
-
-sync_service = CalendarSyncService(config=google_config)
-logger.info("Services initialized successfully")
 
 # WebSocket connections
 active_connections = set()
@@ -108,7 +98,7 @@ async def broadcast_message(message: dict):
 @app.middleware("http")
 async def add_cors_headers(request: Request, call_next):
     response = await call_next(request)
-    if request.headers.get("origin") in ["http://localhost:3000", "http://localhost:3001"]:
+    if request.headers.get("origin") in origins:
         response.headers["Access-Control-Allow-Origin"] = request.headers["origin"]
         response.headers["Access-Control-Allow-Credentials"] = "true"
     return response
@@ -184,282 +174,357 @@ async def global_exception_handler(request, exc):
     """Global exception handler"""
     error_message = str(exc)
     logger.error(f"Error processing request: {error_message}")
-    return {"detail": error_message}
+    return Response(status_code=500, content=json.dumps({"detail": error_message}))
+
+# Pydantic models for API
+class CommandRequest(BaseModel):
+    command: str
+
+class EventData(BaseModel):
+    title: str
+    description: Optional[str] = None
+    start: Optional[datetime] = None
+    end: Optional[datetime] = None
+    duration: Optional[str] = None
+    location: Optional[str] = None
+    participants: Optional[List[str]] = None
+
+class EventResponse(BaseModel):
+    success: bool
+    message: str
+    events: Optional[List[Dict]] = None
+    error: Optional[str] = None
+
+class CommandResponse(BaseModel):
+    success: bool
+    message: str
+    events: Optional[List[EventResponse]] = None
+    error: Optional[str] = None
+
+class SyncStatus(BaseModel):
+    new_events: int = 0
+    updated_events: int = 0
+    deleted_events: int = 0
+    errors: List[str] = []
+
+class EventCreate(BaseModel):
+    title: str
+    description: Optional[str] = None
+    start: datetime
+    end: datetime
+    calendar_id: str
+    source: str
+
+class EventUpdate(EventCreate):
+    id: str
 
 @app.post("/command", response_model=CommandResponse)
-async def process_command(request: CommandRequest, db: Session = Depends(get_db)):
-    """Process natural language command"""
+async def process_command(command: CommandRequest):
     try:
-        logger.info(f"Processing command: {request.command}")
+        logger.info(f"Processing command: {command.command}")
         
-        # Parse command
-        parsed = nlp.parse_command(request.command)
-        logger.debug(f"Parsed command result: {parsed}")
+        # For debugging
+        if not command or not command.command:
+            logger.error("Empty command received")
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "message": "No command provided", "error": "Empty command"}
+            )
         
-        if parsed['intent'] == 'QUERY':
-            logger.info("Executing QUERY intent")
+        # Extract event details using NLP
+        event_details = nlp_processor.extract_event_details(command.command)
+        logger.info(f"Extracted event details: {event_details}")
+        
+        if not event_details or not event_details.get("intent"):
+            logger.error(f"Failed to extract intent from command: {command.command}")
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "message": "Failed to extract event details", "error": "Missing intent"}
+            )
+
+        if event_details["intent"] == "SCHEDULE":
+            # Create an event object from the extracted details
             try:
-                # Query events
-                events = sync_service.query_events(db, parsed)
-                logger.info(f"Found {len(events)} events")
+                title = event_details.get("event", {}).get("title") or event_details.get("title")
+                if not title:
+                    logger.error(f"No title found in extracted event details: {event_details}")
+                    return JSONResponse(
+                        status_code=400,
+                        content={"success": False, "message": "Missing event title", "error": "Title required"}
+                    )
                 
-                event_responses = [
-                    EventResponse(
-                        id=event.id,
-                        title=event.title,
-                        type=event.event_type,
-                        category=event.category,
-                        start_time=event.start_time,
-                        end_time=event.end_time,
-                        location=event.location,
-                        description=event.description,
-                        participants=[p.name for p in event.participants]
-                    ) for event in events
-                ]
-                
-                response = CommandResponse(
-                    success=True,
-                    message="Events retrieved successfully",
-                    events=event_responses
-                )
-                logger.info("Successfully built response")
-                return response
-            except Exception as e:
-                logger.error(f"Error querying events: {e}")
-                logger.error(f"Error type: {type(e)}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error querying events: {str(e)}"
-                )
+                # Parse dates from strings if needed
+                start_time = event_details.get("start_time")
+                if isinstance(start_time, str):
+                    try:
+                        start_time = datetime.fromisoformat(start_time)
+                        
+                        # Check if the date is in the past - this is often a parsing error
+                        current_time = datetime.fromisoformat('2025-02-25T12:00:00-08:00')
+                        if start_time.year < current_time.year:
+                            # Extract time components from parsed date, but use current date
+                            if "tomorrow" in command.command.lower():
+                                base_date = current_time.date() + timedelta(days=1)
+                            else:
+                                base_date = current_time.date()
+                                
+                            # Create a new datetime with today/tomorrow and the parsed time
+                            start_time = datetime.combine(
+                                base_date,
+                                start_time.time(),
+                                tzinfo=current_time.tzinfo
+                            )
+                            logger.info(f"Corrected past date to: {start_time}")
+                    except ValueError as e:
+                        logger.error(f"Error parsing start time: {e}")
+                        return JSONResponse(
+                            status_code=400,
+                            content={"success": False, "message": f"Invalid start time format: {start_time}", "error": str(e)}
+                        )
                     
-        elif parsed['intent'] == 'SCHEDULE':
-            logger.info("Executing SCHEDULE intent")
-            try:
-                # Create event in calendar and database
-                event = sync_service._create_event(db, parsed)
-                
-                # Broadcast update to all clients
-                await broadcast_message({
-                    'type': 'event_created',
-                    'event': event.to_dict()
-                })
-                
-                return CommandResponse(
-                    success=True,
-                    message=f"Event '{event.title}' scheduled successfully",
-                    events=[EventResponse(
-                        id=event.id,
-                        title=event.title,
-                        type=event.event_type,
-                        category=event.category,
-                        start_time=event.start_time,
-                        end_time=event.end_time,
-                        location=event.location,
-                        description=event.description,
-                        participants=[p.name for p in event.participants]
-                    )]
-                )
-            except Exception as e:
-                logger.error(f"Error scheduling event: {e}")
-                logger.error(f"Error type: {type(e)}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error scheduling event: {str(e)}"
-                )
+                end_time = event_details.get("end_time")
+                if isinstance(end_time, str):
+                    end_time = datetime.fromisoformat(end_time)
                     
-        elif parsed['intent'] == 'CANCEL':
-            logger.info("Executing CANCEL intent")
-            try:
-                # Cancel event
-                success = sync_service.cancel_event(db, parsed)
-                return CommandResponse(
-                    success=success,
-                    message="Event cancelled successfully" if success else "Failed to cancel event"
-                )
-            except Exception as e:
-                logger.error(f"Error cancelling event: {e}")
-                logger.error(f"Error type: {type(e)}")
-                logger.error(f"Traceback: {traceback.format_exc()}")
-                raise HTTPException(
-                    status_code=500,
-                    detail=f"Error cancelling event: {str(e)}"
-                )
+                # If end_time is not provided, calculate it from duration or default to 1 hour
+                if not end_time:
+                    duration_minutes = None
+                    if event_details.get("duration"):
+                        try:
+                            duration_minutes = int(event_details["duration"])
+                        except (ValueError, TypeError):
+                            # Try to parse duration string (e.g., "30 minutes", "1 hour")
+                            duration_str = str(event_details["duration"]).lower()
+                            if "hour" in duration_str:
+                                try:
+                                    hours = float(duration_str.split("hour")[0].strip())
+                                    duration_minutes = int(hours * 60)
+                                except (ValueError, TypeError):
+                                    duration_minutes = 60
+                            elif "minute" in duration_str:
+                                try:
+                                    duration_minutes = int(duration_str.split("minute")[0].strip())
+                                except (ValueError, TypeError):
+                                    duration_minutes = 30
                     
-        elif parsed['intent'] == 'UPDATE':
-            logger.info("Executing UPDATE intent")
-            try:
-                # Update event
-                success = sync_service.update_event(db, parsed)
-                return CommandResponse(
-                    success=success,
-                    message="Event updated successfully" if success else "Failed to update event"
-                )
+                    # Default to 1 hour if duration couldn't be parsed
+                    if not duration_minutes:
+                        duration_minutes = 60
+                        
+                    logger.info(f"No end time provided, using duration of {duration_minutes} minutes")
+                    end_time = start_time + timedelta(minutes=duration_minutes)
+                
+                event_data = {
+                    "title": title,
+                    "description": event_details.get("event", {}).get("description") or event_details.get("description"),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "location": event_details.get("location"),
+                    "participants": event_details.get("participants", [])
+                }
+                
+                logger.info(f"Creating event with data: {event_data}")
+                
+                # Create the event
+                result = await calendar_sync_service.schedule_event(event_data)
+                
+                if result["success"]:
+                    logger.info(f"Event scheduled successfully: {result['event']['id']}")
+                    command_result = {
+                        "success": True,
+                        "result": f"Event '{result['event']['title']}' scheduled for {result['event']['start']}",
+                        "data": result["event"]
+                    }
+                    return JSONResponse(content=command_result)
+                else:
+                    logger.error(f"Error scheduling event: {result.get('error', 'Unknown error')}")
+                    return JSONResponse(
+                        status_code=500,
+                        content={"success": False, "message": f"Error scheduling event: {result.get('error', 'Unknown error')}", "error": result.get('error')}
+                    )
+                
             except Exception as e:
-                logger.error(f"Error updating event: {e}")
-                logger.error(f"Error type: {type(e)}")
+                logger.error(f"Error creating event object: {str(e)}")
                 logger.error(f"Traceback: {traceback.format_exc()}")
-                raise HTTPException(
+                return JSONResponse(
                     status_code=500,
-                    detail=f"Error updating event: {str(e)}"
+                    content={"success": False, "message": f"Error creating event: {str(e)}", "error": str(e)}
                 )
         else:
-            logger.info(f"Unknown intent: {parsed['intent']}")
-            raise HTTPException(status_code=400, detail="Unknown command intent")
-                
+            logger.error(f"Unsupported intent: {event_details['intent']}")
+            return JSONResponse(
+                status_code=400,
+                content={"success": False, "message": f"Unsupported intent: {event_details['intent']}", "error": "Unsupported intent"}
+            )
+
     except Exception as e:
-        logger.error(f"Error processing command: {e}")
+        logger.error(f"Error processing command: {str(e)}")
         logger.error(f"Error type: {type(e)}")
         logger.error(f"Traceback: {traceback.format_exc()}")
-        return CommandResponse(
-            success=False,
-            message="Error processing command",
-            error=str(e)
+        return JSONResponse(
+            status_code=500,
+            content={"success": False, "message": f"Error processing command: {str(e)}", "error": str(e)}
         )
 
-@app.post("/sync", response_model=SyncStatus)
-async def sync_calendar(db: Session = Depends(get_db)):
-    """Sync calendar events"""
+@app.post("/sync")
+async def sync_calendars(db: Session = Depends(get_db)):
+    """Sync calendars from Google Calendar"""
     try:
-        # Get the configured calendar ID
+        # Get configured calendar ID
         calendar_id = os.getenv('GOOGLE_CALENDAR_IDS', '').split(',')[0]
         if not calendar_id:
             raise ValueError("No calendar ID configured")
             
-        sync_service = CalendarSyncService(config=config.config.get('google'))
-        result = sync_service.sync_calendar(calendar_id=calendar_id)
+        result = calendar_sync_service.sync_calendars(db)
         
         # Notify connected clients
         await broadcast_message({
             "type": "sync_complete",
-            "stats": result
+            "data": {
+                "success": result["success"],
+                "new_events": result.get("events_synced", 0),
+                "updated_events": result.get("events_updated", 0),
+                "deleted_events": result.get("events_deleted", 0),
+                "errors": result.get("errors", [])
+            }
         })
         
-        return result
+        return {"message": "Calendar sync complete", "result": result}
+        
     except Exception as e:
-        logger.error(f"Error syncing calendar: {e}")
-        logger.error(f"Error type: {type(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error syncing calendars: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error syncing calendars: {str(e)}"}),
+            media_type="application/json"
+        )
 
-@app.get("/events/today", response_model=List[EventResponse])
-async def get_today_events(db: Session = Depends(get_db)):
-    """Get today's events"""
+@app.get("/events/today")
+async def get_today_events():
+    """Get events for today"""
     try:
-        logger.info("Fetching today's events")
-        tz = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(tz)
-        start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        end = start + timedelta(days=1)
+        today = datetime.now(ZoneInfo('America/Los_Angeles')).replace(hour=0, minute=0, second=0, microsecond=0)
+        tomorrow = today + timedelta(days=1)
         
-        events = sync_service.get_events_between(db, start, end)
-        logger.info(f"Found {len(events)} events")
+        logger.info(f"Getting events between {today} and {tomorrow}")
         
-        return [EventResponse(
-            id=event.id,
-            title=event.title,
-            type=event.event_type,
-            category=event.category,
-            start_time=event.start_time,
-            end_time=event.end_time,
-            location=event.location,
-            description=event.description,
-            participants=[p.name for p in event.participants]
-        ) for event in events]
+        # Get events from calendar service
+        response = calendar_sync_service.list_events(today, tomorrow)
+        
+        if not response.get("success", False):
+            return Response(
+                status_code=500,
+                content=json.dumps({"error": response.get("error", "Unknown error")}),
+                media_type="application/json"
+            )
+        
+        return response.get("events", [])
     except Exception as e:
-        logger.error(f"Error fetching today's events: {e}")
-        logger.error(f"Error type: {type(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting today's events: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error getting today's events: {str(e)}"}),
+            media_type="application/json"
+        )
 
-@app.get("/events/week", response_model=List[EventResponse])
+@app.get("/events/week")
 async def get_week_events():
-    """Get events for the current week"""
+    """Get events for the current week (Monday to Sunday)"""
     try:
-        logger.info("Fetching week events...")
+        today = datetime.now(ZoneInfo('America/Los_Angeles'))
         
-        # Get current time from metadata
-        current_time = datetime.fromisoformat('2025-02-21T22:32:30-08:00')
+        # Get the start of the week (Monday)
+        start_of_week = today - timedelta(days=today.weekday())
+        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
         
-        # Calculate start of week (Sunday) and end of week (Saturday)
-        start_of_week = current_time.replace(hour=0, minute=0, second=0, microsecond=0) - timedelta(days=current_time.weekday())
+        # Get the end of the week (Sunday)
         end_of_week = start_of_week + timedelta(days=7)
         
         logger.info(f"Getting events between {start_of_week} and {end_of_week}")
         
         # Get events from calendar service
-        return sync_service.get_events_between(start_of_week, end_of_week)
+        response = calendar_sync_service.list_events(start_of_week, end_of_week)
         
+        if not response.get("success", False):
+            return Response(
+                status_code=500,
+                content=json.dumps({"error": response.get("error", "Unknown error")}),
+                media_type="application/json"
+            )
+        
+        return response.get("events", [])
     except Exception as e:
-        logger.error(f"Error getting week events: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting week's events: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error getting week's events: {str(e)}"}),
+            media_type="application/json"
+        )
 
-@app.get("/events/month", response_model=List[EventResponse])
-async def get_month_events(db: Session = Depends(get_db)):
-    """Get this month's events"""
+@app.get("/events/month")
+async def get_month_events():
+    """Get events for the current month"""
     try:
-        logger.info("Fetching month events")
-        tz = pytz.timezone('America/Los_Angeles')
-        now = datetime.now(tz)
-        start = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        today = datetime.now(ZoneInfo('America/Los_Angeles'))
         
-        # Calculate end of month
-        if now.month == 12:
-            end = now.replace(year=now.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
+        # Calculate first day of month
+        start = today.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+        
+        # Calculate first day of next month
+        if today.month == 12:
+            end = today.replace(year=today.year + 1, month=1, day=1, hour=0, minute=0, second=0, microsecond=0)
         else:
-            end = now.replace(month=now.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
+            end = today.replace(month=today.month + 1, day=1, hour=0, minute=0, second=0, microsecond=0)
         
-        events = sync_service.get_events_between(db, start, end)
-        logger.info(f"Found {len(events)} events")
+        logger.info(f"Getting events between {start} and {end}")
         
-        return [EventResponse(
-            id=event.id,
-            title=event.title,
-            type=event.event_type,
-            category=event.category,
-            start_time=event.start_time,
-            end_time=event.end_time,
-            location=event.location,
-            description=event.description,
-            participants=[p.name for p in event.participants]
-        ) for event in events]
+        # Get events from calendar service
+        response = calendar_sync_service.list_events(start, end)
+        
+        if not response.get("success", False):
+            return Response(
+                status_code=500,
+                content=json.dumps({"error": response.get("error", "Unknown error")}),
+                media_type="application/json"
+            )
+        
+        return response.get("events", [])
     except Exception as e:
-        logger.error(f"Error fetching month events: {e}")
-        logger.error(f"Error type: {type(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting month's events: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error getting month's events: {str(e)}"}),
+            media_type="application/json"
+        )
 
-@app.get("/events/range", response_model=List[EventResponse])
-async def get_events_range(start: datetime, end: datetime, db: Session = Depends(get_db)):
-    """Get events within a date range"""
+@app.get("/events/range")
+async def get_events_by_range(start_date: str, end_date: str):
+    """Get events between start_date and end_date. Dates should be ISO format (YYYY-MM-DD)"""
     try:
-        logger.info("Fetching events within date range")
-        tz = pytz.timezone('America/Los_Angeles')
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=tz)
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=tz)
-            
-        events = sync_service.get_events_between(db, start, end)
-        logger.info(f"Found {len(events)} events")
+        # Parse dates
+        start = datetime.fromisoformat(start_date)
+        end = datetime.fromisoformat(end_date)
         
-        return [EventResponse(
-            id=event.id,
-            title=event.title,
-            type=event.event_type,
-            category=event.category,
-            start_time=event.start_time,
-            end_time=event.end_time,
-            location=event.location,
-            description=event.description,
-            participants=[p.name for p in event.participants]
-        ) for event in events]
+        logger.info(f"Getting events between {start} and {end}")
+        
+        # Get events from calendar service
+        response = calendar_sync_service.list_events(start, end)
+        
+        if not response.get("success", False):
+            return Response(
+                status_code=500,
+                content=json.dumps({"error": response.get("error", "Unknown error")}),
+                media_type="application/json"
+            )
+        
+        return response.get("events", [])
     except Exception as e:
-        logger.error(f"Error fetching events within date range: {e}")
-        logger.error(f"Error type: {type(e)}")
-        logger.error(f"Traceback: {traceback.format_exc()}")
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error(f"Error getting events for date range: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error getting events for date range: {str(e)}"}),
+            media_type="application/json"
+        )
 
 @app.get("/health")
 async def health_check():
@@ -474,7 +539,12 @@ async def get_calendars(session: Session = Depends(get_db)):
         return calendar_manager.get_calendars(session)
     except Exception as e:
         logger.error(f"Error getting calendars: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = EventResponse(
+            success=False,
+            message=f"Error getting calendars: {str(e)}",
+            error=str(e)
+        )
+        return Response(status_code=500, content=json.dumps(response_content.model_dump()))
 
 @app.get("/calendars/{calendar_id}", response_model=Dict)
 async def get_calendar(calendar_id: str, session: Session = Depends(get_db)):
@@ -489,7 +559,12 @@ async def get_calendar(calendar_id: str, session: Session = Depends(get_db)):
         raise
     except Exception as e:
         logger.error(f"Error getting calendar {calendar_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = EventResponse(
+            success=False,
+            message=f"Error getting calendar {calendar_id}: {str(e)}",
+            error=str(e)
+        )
+        return Response(status_code=500, content=json.dumps(response_content.model_dump()))
 
 @app.post("/calendars/{calendar_id}", response_model=Dict)
 async def add_calendar(calendar_id: str, session: Session = Depends(get_db)):
@@ -499,7 +574,12 @@ async def add_calendar(calendar_id: str, session: Session = Depends(get_db)):
         return calendar_manager.add_calendar(session, calendar_id)
     except Exception as e:
         logger.error(f"Error adding calendar {calendar_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = EventResponse(
+            success=False,
+            message=f"Error adding calendar {calendar_id}: {str(e)}",
+            error=str(e)
+        )
+        return Response(status_code=500, content=json.dumps(response_content.model_dump()))
 
 @app.delete("/calendars/{calendar_id}")
 async def remove_calendar(calendar_id: str, session: Session = Depends(get_db)):
@@ -510,7 +590,12 @@ async def remove_calendar(calendar_id: str, session: Session = Depends(get_db)):
         return {"message": f"Calendar {calendar_id} removed successfully"}
     except Exception as e:
         logger.error(f"Error removing calendar {calendar_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = EventResponse(
+            success=False,
+            message=f"Error removing calendar {calendar_id}: {str(e)}",
+            error=str(e)
+        )
+        return Response(status_code=500, content=json.dumps(response_content.model_dump()))
 
 @app.put("/calendars/{calendar_id}/colors")
 async def update_calendar_colors(
@@ -527,14 +612,115 @@ async def update_calendar_colors(
         )
     except Exception as e:
         logger.error(f"Error updating calendar colors for {calendar_id}: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = EventResponse(
+            success=False,
+            message=f"Error updating calendar colors for {calendar_id}: {str(e)}",
+            error=str(e)
+        )
+        return Response(status_code=500, content=json.dumps(response_content.model_dump()))
 
 @app.post("/calendars/sync")
 async def sync_calendars(session: Session = Depends(get_db)):
     """Sync calendars from Google Calendar."""
     try:
         calendar_manager = CalendarManager()
-        return calendar_manager.sync_calendars(session)
+        result = calendar_manager.sync_calendars(session)
+        return {"success": True, "message": "Calendars synced successfully", "data": result}
     except Exception as e:
         logger.error(f"Error syncing calendars: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        response_content = {
+            "success": False,
+            "message": f"Error syncing calendars: {str(e)}",
+            "error": str(e)
+        }
+        return Response(status_code=500, content=json.dumps(response_content))
+
+@app.delete("/events/{event_id}")
+async def delete_event(event_id: str, db: Session = Depends(get_db)):
+    """Delete an event from the calendar"""
+    try:
+        deletion_success = calendar_sync_service.delete_event(event_id)
+        return {"message": "Event deleted successfully" if deletion_success else "Event not found"}
+    except Exception as e:
+        logger.error(f"Error deleting event {event_id}: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({"error": f"Error deleting event: {str(e)}"}),
+            media_type="application/json"
+        )
+
+@app.post("/events")
+async def create_event(event: EventCreate, db: Session = Depends(get_db)):
+    """Create a new calendar event."""
+    try:
+        # Check if calendar exists
+        calendar = db.query(Calendar).filter_by(id=event.calendar_id).first()
+        if not calendar:
+            return Response(
+                status_code=404,
+                content=json.dumps({
+                    "success": False,
+                    "error": f"Calendar {event.calendar_id} not found"
+                })
+            )
+
+        # Create event
+        new_event = DBCalendarEvent(
+            id=str(uuid.uuid4()),
+            title=event.title,
+            description=event.description,
+            start=event.start,
+            end=event.end,
+            calendar_id=event.calendar_id,
+            source=event.source
+        )
+        db.begin()
+        try:
+            db.add(new_event)
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            logger.error(f"Error creating event: {str(e)}")
+            return Response(
+                status_code=500,
+                content=json.dumps({
+                    "success": False,
+                    "error": str(e)
+                })
+            )
+        db.refresh(new_event)
+
+        return {"success": True, "events": [new_event.to_dict()]}
+
+    except Exception as e:
+        logger.error(f"Error creating event: {str(e)}")
+        return Response(
+            status_code=500,
+            content=json.dumps({
+                "success": False,
+                "error": str(e)
+            })
+        )
+
+@app.put("/events/{event_id}")
+async def update_event(event_id: str, event: EventUpdate, db: Session = Depends(get_db)):
+    """Update an existing calendar event."""
+    try:
+        db_event = db.query(DBCalendarEvent).filter_by(id=event_id).first()
+        if not db_event:
+            return Response(status_code=404, content=json.dumps({"message": "Event not found"}))
+
+        for key, value in event.dict(exclude={'id'}).items():
+            setattr(db_event, key, value)
+
+        db.commit()
+        db.refresh(db_event)
+        return {"success": True, "events": [db_event.to_dict()]}
+    except Exception as e:
+        logger.error(f"Error updating event {event_id}: {str(e)}")
+        return Response(status_code=500, content=json.dumps({"error": str(e)}))
+
+if __name__ == "__main__":
+    import uvicorn
+    logger.info("Starting FastAPI application with uvicorn...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

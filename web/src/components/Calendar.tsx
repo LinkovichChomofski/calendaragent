@@ -95,29 +95,30 @@ export default function Calendar({ events, onDateSelect, selectedDate }: Calenda
   ServerDay.displayName = 'ServerDay';
 
   return (
-    <Paper elevation={3} sx={{ p: 2 }}>
-      <Box sx={{ display: 'flex', alignItems: 'center', mb: 2 }}>
-        <IconButton onClick={handlePrevMonth}>
-          <ChevronLeft />
-        </IconButton>
-        <Typography variant="h6" sx={{ flex: 1, textAlign: 'center' }}>
-          {format(currentMonth, 'MMMM yyyy')}
-        </Typography>
-        <IconButton onClick={handleNextMonth}>
-          <ChevronRight />
-        </IconButton>
+    <Paper elevation={3} sx={{ p: 2, height: '100%' }}>
+      <Box sx={{ mb: 2, display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+        <Typography variant="h6">{format(currentMonth, 'MMMM yyyy')}</Typography>
+        <Box>
+          <IconButton onClick={handlePrevMonth} size="small">
+            <ChevronLeft />
+          </IconButton>
+          <IconButton onClick={handleNextMonth} size="small">
+            <ChevronRight />
+          </IconButton>
+        </Box>
       </Box>
+      
       <LocalizationProvider dateAdapter={AdapterDateFns}>
         <DateCalendar
           value={selectedDate}
           onChange={(newDate) => newDate && onDateSelect(newDate)}
           slots={{
-            day: ServerDay
+            day: ServerDay as React.ComponentType<PickersDayProps<Date>>
           }}
           sx={{
             width: '100%',
-            '& .MuiPickersCalendarHeader-root': {
-              display: 'none',
+            '& .MuiPickersDay-root': {
+              fontSize: '0.875rem',
             },
           }}
         />

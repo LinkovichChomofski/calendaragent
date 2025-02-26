@@ -1,31 +1,30 @@
-from sqlalchemy import Column, String, Boolean, DateTime
-from sqlalchemy.sql import func
+from datetime import datetime
+from sqlalchemy import Column, String, DateTime, Boolean, func
+from sqlalchemy.orm import relationship
 from src.models.base import Base
 
 class Calendar(Base):
     __tablename__ = 'calendars'
 
     id = Column(String, primary_key=True)
-    summary = Column(String)
-    description = Column(String, nullable=True)
-    time_zone = Column(String)
-    background_color = Column(String, nullable=True)
-    foreground_color = Column(String, nullable=True)
-    access_role = Column(String)
-    is_primary = Column(Boolean, default=False)
+    google_id = Column(String, unique=True)
+    name = Column(String, nullable=False)
+    owner_email = Column(String, nullable=False)
+    last_synced = Column(DateTime(timezone=True))
+    is_deleted = Column(Boolean, default=False)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
     updated_at = Column(DateTime(timezone=True), onupdate=func.now())
+
+    events = relationship("CalendarEvent", back_populates="calendar", cascade="all, delete-orphan")
 
     def to_dict(self):
         return {
             'id': self.id,
-            'summary': self.summary,
-            'description': self.description,
-            'timeZone': self.time_zone,
-            'backgroundColor': self.background_color,
-            'foregroundColor': self.foreground_color,
-            'accessRole': self.access_role,
-            'primary': self.is_primary,
-            'createdAt': self.created_at.isoformat() if self.created_at else None,
-            'updatedAt': self.updated_at.isoformat() if self.updated_at else None
+            'google_id': self.google_id,
+            'name': self.name,
+            'owner_email': self.owner_email,
+            'last_synced': self.last_synced,
+            'is_deleted': self.is_deleted,
+            'created_at': self.created_at,
+            'updated_at': self.updated_at
         }

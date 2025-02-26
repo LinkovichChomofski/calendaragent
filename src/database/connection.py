@@ -1,7 +1,8 @@
 from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import QueuePool
-from src.database.models import Base, Calendar, Event, Participant, SyncState
+from src.models.base import Base
+from src.database.models import Calendar, CalendarEvent, CalendarParticipant, calendar_event_participants, SyncState
 import os
 import logging
 from datetime import datetime
@@ -28,6 +29,10 @@ class DatabaseManager:
             pool_recycle=1800,
             connect_args={'detect_types': 3}  # Enable parsing of both string and timestamp formats
         )
+        
+        # Create all tables
+        Base.metadata.create_all(bind=self.engine)
+        logger.info("Database tables created successfully")
         
         # Register timezone conversion functions
         @event.listens_for(self.engine, 'connect')
@@ -66,19 +71,16 @@ class DatabaseManager:
     def init_database(self):
         """Initialize database tables"""
         try:
-            Base.metadata.create_all(bind=self.engine)
-            logger.info("Database tables created successfully")
-            
             # Create primary calendar if it doesn't exist
             with self.get_session() as session:
                 primary_calendar = session.query(Calendar).filter(Calendar.id == 'primary').first()
                 if not primary_calendar:
                     primary_calendar = Calendar(
                         id='primary',
-                        summary='Primary Calendar',
-                        time_zone='America/Los_Angeles',
-                        access_role='owner',
-                        is_primary=True
+                        google_id='primary',
+                        name='Primary Calendar',
+                        owner_email='user@example.com',
+                        last_synced=datetime.now(self.timezone)
                     )
                     session.add(primary_calendar)
                     session.commit()
@@ -90,3 +92,14 @@ class DatabaseManager:
             
     def get_session(self):
         return self.SessionLocal()
+
+# Create a default database manager instance
+db_manager = DatabaseManager()
+
+def get_db():
+    """FastAPI dependency that provides a database session"""
+    db = db_manager.get_session()
+    try:
+        yield db
+    finally:
+        db.close()

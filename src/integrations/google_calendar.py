@@ -5,7 +5,7 @@ from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
-from datetime import datetime
+from datetime import datetime, timedelta
 import socket
 from typing import Optional, List, Dict, Any
 import logging
@@ -100,59 +100,66 @@ class GoogleCalendarClient:
     def get_calendar(self, calendar_id: str) -> Optional[Dict[str, Any]]:
         """Get a specific calendar"""
         try:
-            logger.info(f"Attempting to get calendar with ID: {calendar_id}")
-            calendar = self.service.calendars().get(calendarId=calendar_id).execute()
-            logger.info(f"Successfully retrieved calendar: {calendar}")
-            return calendar
+            return self.service.calendars().get(calendarId=calendar_id).execute()
         except Exception as e:
-            logger.error(f"Error fetching calendar {calendar_id}: {str(e)}")
-            logger.error(f"Full error details: {type(e).__name__}: {str(e)}")
+            logger.error(f"Error getting calendar {calendar_id}: {str(e)}")
             return None
-            
+
     def get_events(self, calendar_id: str, time_min: datetime = None, time_max: datetime = None) -> List[Dict[str, Any]]:
-        """Get events from calendar"""
+        """Get events from a calendar"""
         try:
-            logger.info(f"Fetching events for calendar {calendar_id} from {time_min} to {time_max}")
+            # Default to retrieving events from 6 months ago to 6 months in the future if not specified
+            if not time_min:
+                time_min = datetime.now() - timedelta(days=180)
+            if not time_max:
+                time_max = datetime.now() + timedelta(days=180)
+                
+            # Convert datetime objects to RFC3339 timestamps
+            # Check if the input is already a string
+            if isinstance(time_min, str):
+                time_min_str = time_min
+            else:
+                time_min_str = time_min.isoformat() + 'Z' if time_min and not time_min.tzinfo else None
+                
+            if isinstance(time_max, str):
+                time_max_str = time_max
+            else:
+                time_max_str = time_max.isoformat() + 'Z' if time_max and not time_max.tzinfo else None
             
-            # Format timestamps in RFC3339 format
-            time_min_str = time_min.isoformat() if time_min else None
-            time_max_str = time_max.isoformat() if time_max else None
+            logger.info(f"Fetching events for calendar {calendar_id} from {time_min_str} to {time_max_str}")
+            
+            # Build request
+            request = self.service.events().list(
+                calendarId=calendar_id,
+                timeMin=time_min_str,
+                timeMax=time_max_str,
+                singleEvents=True,
+                maxResults=2500,  # Fetch more events at once
+                orderBy='startTime'
+            )
             
             events = []
-            page_token = None
-            while True:
-                events_result = self.service.events().list(
-                    calendarId=calendar_id,
-                    timeMin=time_min_str,
-                    timeMax=time_max_str,
-                    singleEvents=True,  # Get recurring events expanded into individual instances
-                    orderBy='startTime',  # Order by start time since we're getting individual instances
-                    maxResults=2500,  # Maximum allowed by the API
-                    pageToken=page_token,
-                    showDeleted=False
-                ).execute()
+            while request is not None:
+                response = request.execute()
+                events.extend(response.get('items', []))
+                request = self.service.events().list_next(request, response)
                 
-                events.extend(events_result.get('items', []))
-                page_token = events_result.get('nextPageToken')
-                if not page_token:
-                    break
-            
-            logger.info(f"Retrieved {len(events)} events")
             return events
-            
         except Exception as e:
-            logger.error(f"Error fetching events for calendar {calendar_id}: {str(e)}")
-            logger.error(f"Full error details: {e}")
+            logger.error(f"Error getting events for calendar {calendar_id}: {str(e)}")
             return []
-            
+
     def create_event(self, calendar_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """Create a new event"""
+        """Create a new event in the calendar"""
         try:
-            return self.service.events().insert(calendarId=calendar_id, body=event).execute()
+            return self.service.events().insert(
+                calendarId=calendar_id,
+                body=event
+            ).execute()
         except Exception as e:
             logger.error(f"Error creating event in calendar {calendar_id}: {str(e)}")
             return None
-            
+
     def update_event(self, calendar_id: str, event_id: str, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """Update an existing event"""
         try:
@@ -164,12 +171,18 @@ class GoogleCalendarClient:
         except Exception as e:
             logger.error(f"Error updating event {event_id} in calendar {calendar_id}: {str(e)}")
             return None
-            
+
     def delete_event(self, calendar_id: str, event_id: str) -> bool:
-        """Delete an event"""
+        """Delete an event from the calendar"""
         try:
-            self.service.events().delete(calendarId=calendar_id, eventId=event_id).execute()
+            self.service.events().delete(
+                calendarId=calendar_id,
+                eventId=event_id
+            ).execute()
             return True
         except Exception as e:
             logger.error(f"Error deleting event {event_id} from calendar {calendar_id}: {str(e)}")
             return False
+
+    def list_calendars(self):
+        return self.get_calendar_list()
